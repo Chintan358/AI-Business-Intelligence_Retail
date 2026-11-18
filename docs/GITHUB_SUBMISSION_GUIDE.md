@@ -1,11 +1,20 @@
-# GitHub Submission & Repository Structure Guide
+# GitHub Submission & Repository Guide
 
 **Project:** AI-Powered Smart Business Operations & Decision Intelligence System  
 **Industry:** Retail – Sales & Inventory Operations  
+**Live GitHub Repository:** [https://github.com/Chintan358/AI-Business-Intelligence_Retail](https://github.com/Chintan358/AI-Business-Intelligence_Retail)  
+**Default Branch:** `main`  
 
 ---
 
-## 1. Clean Repository Hygiene Guidelines
+## 1. Repository Information
+
+- **URL:** `https://github.com/Chintan358/AI-Business-Intelligence_Retail.git`
+- **Branch:** `main`
+- **Total Files:** 114 production source and documentation files
+- **Pushed Commits:**
+  - `feat: complete enterprise retail decision intelligence multi-agent AI system`
+  - `docs: finalize 100-mark evaluation checklist in PROJECT_PROGRESS.md`
 
 1. **Never Commit Secrets**: Ensure `.env` and API keys are included in `.gitignore`.
 2. **Never Commit Temporary Artifacts**: Exclude `node_modules/`, `venv/`, `__pycache__/`, `.pytest_cache/`, `dist/`.

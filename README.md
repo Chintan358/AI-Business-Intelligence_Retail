@@ -1,6 +1,7 @@
 # AI-Powered Smart Business Operations & Decision Intelligence System
 ## Industry: RETAIL | Full-Stack Multi-Agent AI Application
 
+[![GitHub Repo](https://img.shields.io/badge/GitHub-Repository-181717.svg?style=flat&logo=github)](https://github.com/Chintan358/AI-Business-Intelligence_Retail)
 [![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688.svg?style=flat&logo=fastapi)](https://fastapi.tiangolo.com)
 [![React](https://img.shields.io/badge/Frontend-React%2018%20%2B%20Vite-61DAFB.svg?style=flat&logo=react)](https://react.dev)
 [![CrewAI](https://img.shields.io/badge/Multi--Agent-CrewAI%200.86%2B-FF4B4B.svg?style=flat)](https://crewai.com)
