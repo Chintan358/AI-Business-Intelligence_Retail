@@ -3,9 +3,9 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
-from config import settings
-from database import engine, Base
-from routers import (
+from backend.config import settings
+from backend.database import engine, Base
+from backend.routers import (
     auth, users, business, datasets, analytics, kpis,
     agents, analysis, chat, reports, approvals, admin
 )
@@ -76,4 +76,4 @@ async def global_exception_handler(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=port, reload=False)

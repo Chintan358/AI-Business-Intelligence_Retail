@@ -4,10 +4,10 @@ import sys
 # Ensure root directory is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from backend.database import engine, Base, SessionLocal
-from backend.models import User, BusinessProfile
-from backend.services.auth_service import get_password_hash
-from backend.services.ingestion_service import seed_database_from_excel
+from database import engine, Base, SessionLocal
+from models import User, BusinessProfile
+from services.auth_service import get_password_hash
+from services.ingestion_service import seed_database_from_excel
 
 def init_db():
     print("Creating all database tables...")
