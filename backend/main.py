@@ -3,9 +3,9 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
-from backend.config import settings
-from backend.database import engine, Base
-from backend.routers import (
+from config import settings
+from database import engine, Base
+from routers import (
     auth, users, business, datasets, analytics, kpis,
     agents, analysis, chat, reports, approvals, admin
 )
