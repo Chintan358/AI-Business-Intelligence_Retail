@@ -1,0 +1,89 @@
+from pydantic import BaseModel
+from typing import List, Dict, Any, Optional
+
+class ExecutiveKPIResponse(BaseModel):
+    period: str
+    total_transactions: int
+    completed_orders: int
+    returned_orders: int
+    cancelled_orders: int
+    order_completion_rate_pct: float
+    order_return_rate_pct: float
+    order_cancellation_rate_pct: float
+    gross_revenue: float
+    discount_amount: float
+    net_revenue: float
+    returned_revenue_lost: float
+    cancelled_revenue_lost: float
+    aov: float
+    total_units_sold: int
+    avg_units_per_order: float
+    cogs: float
+    gross_profit: float
+    gross_profit_margin_pct: float
+    total_operating_expenses: float
+    net_operating_profit: float
+    operating_margin_pct: float
+    active_customers: int
+    repeat_customers: int
+    repeat_purchase_rate_pct: float
+    stockout_risk_count: int
+
+class MonthlyMetricItem(BaseModel):
+    month: str
+    completed_orders: int
+    gross_revenue: float
+    discounts: float
+    net_revenue: float
+    cogs: float
+    operating_expenses: float
+    gross_profit: float
+    gross_margin_pct: float
+    net_operating_profit: float
+    operating_margin_pct: float
+    aov: float
+    revenue_mom_growth_pct: float
+
+class CategoryPerformanceItem(BaseModel):
+    category: str
+    total_revenue: float
+    total_units_sold: int
+    total_cogs: float
+    gross_profit: float
+    gross_margin_pct: float
+    revenue_share_pct: float
+
+class ChannelPerformanceItem(BaseModel):
+    channel: str
+    total_orders: int
+    completed_orders: int
+    returned_orders: int
+    cancelled_orders: int
+    total_gross: float
+    completed_net_revenue: float
+    returned_lost_revenue: float
+    return_rate_pct: float
+    cancellation_rate_pct: float
+    completion_rate_pct: float
+
+class StorePerformanceItem(BaseModel):
+    store_id: str
+    completed_orders: int
+    net_revenue: float
+    cogs: float
+    operating_expenses: float
+    gross_profit: float
+    gross_margin_pct: float
+    net_operating_profit: float
+    operating_margin_pct: float
+
+class StockoutAlertItem(BaseModel):
+    product_id: str
+    product_name: str
+    category: str
+    unit_price: float
+    unit_cost: float
+    current_stock: int
+    reorder_level: int
+    deficit: int
+    supplier_id: str

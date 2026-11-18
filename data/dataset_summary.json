@@ -1,0 +1,327 @@
+{
+  "Customers": {
+    "rows": 1200,
+    "columns": [
+      "customer_id",
+      "customer_name",
+      "city",
+      "signup_date",
+      "customer_segment",
+      "email"
+    ],
+    "dtypes": {
+      "customer_id": "object",
+      "customer_name": "object",
+      "city": "object",
+      "signup_date": "object",
+      "customer_segment": "object",
+      "email": "object"
+    },
+    "null_counts": {
+      "customer_id": 0,
+      "customer_name": 0,
+      "city": 0,
+      "signup_date": 0,
+      "customer_segment": 0,
+      "email": 0
+    },
+    "sample": [
+      {
+        "customer_id": "CUS00001",
+        "customer_name": "Aadhya Sharma",
+        "city": "Gandhinagar",
+        "signup_date": "2026-07-06",
+        "customer_segment": "Regular",
+        "email": "aadhya.sharma30@example.com"
+      },
+      {
+        "customer_id": "CUS00002",
+        "customer_name": "Diya Kapoor",
+        "city": "Gandhinagar",
+        "signup_date": "2026-06-17",
+        "customer_segment": "Premium",
+        "email": "diya.kapoor56@example.com"
+      }
+    ]
+  },
+  "Products": {
+    "rows": 300,
+    "columns": [
+      "product_id",
+      "product_name",
+      "category",
+      "unit_price",
+      "unit_cost",
+      "reorder_level",
+      "supplier_id"
+    ],
+    "dtypes": {
+      "product_id": "object",
+      "product_name": "object",
+      "category": "object",
+      "unit_price": "float64",
+      "unit_cost": "float64",
+      "reorder_level": "int64",
+      "supplier_id": "object"
+    },
+    "null_counts": {
+      "product_id": 0,
+      "product_name": 0,
+      "category": 0,
+      "unit_price": 0,
+      "unit_cost": 0,
+      "reorder_level": 0,
+      "supplier_id": 0
+    },
+    "sample": [
+      {
+        "product_id": "PRD0001",
+        "product_name": "Bedsheet 001",
+        "category": "Home",
+        "unit_price": 20222.29,
+        "unit_cost": 6571.08,
+        "reorder_level": 57,
+        "supplier_id": "SUP057"
+      },
+      {
+        "product_id": "PRD0002",
+        "product_name": "Bluetooth Speaker 002",
+        "category": "Electronics",
+        "unit_price": 15545.65,
+        "unit_cost": 10939.8,
+        "reorder_level": 55,
+        "supplier_id": "SUP069"
+      }
+    ]
+  },
+  "Transactions": {
+    "rows": 2500,
+    "columns": [
+      "transaction_id",
+      "customer_id",
+      "transaction_date",
+      "store_id",
+      "channel",
+      "gross_amount",
+      "discount",
+      "net_amount",
+      "payment_method",
+      "order_status"
+    ],
+    "dtypes": {
+      "transaction_id": "object",
+      "customer_id": "object",
+      "transaction_date": "object",
+      "store_id": "object",
+      "channel": "object",
+      "gross_amount": "float64",
+      "discount": "float64",
+      "net_amount": "float64",
+      "payment_method": "object",
+      "order_status": "object"
+    },
+    "null_counts": {
+      "transaction_id": 0,
+      "customer_id": 0,
+      "transaction_date": 0,
+      "store_id": 0,
+      "channel": 0,
+      "gross_amount": 0,
+      "discount": 0,
+      "net_amount": 0,
+      "payment_method": 0,
+      "order_status": 0
+    },
+    "sample": [
+      {
+        "transaction_id": "TRX00001",
+        "customer_id": "CUS00310",
+        "transaction_date": "2026-09-16",
+        "store_id": "STR09",
+        "channel": "In-store",
+        "gross_amount": 163093.65,
+        "discount": 16309.36,
+        "net_amount": 146784.29,
+        "payment_method": "Card",
+        "order_status": "Cancelled"
+      },
+      {
+        "transaction_id": "TRX00002",
+        "customer_id": "CUS00984",
+        "transaction_date": "2026-09-26",
+        "store_id": "STR06",
+        "channel": "Mobile App",
+        "gross_amount": 66812.04,
+        "discount": 6681.2,
+        "net_amount": 60130.84,
+        "payment_method": "UPI",
+        "order_status": "Completed"
+      }
+    ]
+  },
+  "Transaction_Items": {
+    "rows": 6269,
+    "columns": [
+      "line_item_id",
+      "transaction_id",
+      "product_id",
+      "quantity",
+      "unit_price",
+      "line_total"
+    ],
+    "dtypes": {
+      "line_item_id": "object",
+      "transaction_id": "object",
+      "product_id": "object",
+      "quantity": "int64",
+      "unit_price": "float64",
+      "line_total": "float64"
+    },
+    "null_counts": {
+      "line_item_id": 0,
+      "transaction_id": 0,
+      "product_id": 0,
+      "quantity": 0,
+      "unit_price": 0,
+      "line_total": 0
+    },
+    "sample": [
+      {
+        "line_item_id": "LIN000001",
+        "transaction_id": "TRX00001",
+        "product_id": "PRD0085",
+        "quantity": 5,
+        "unit_price": 18175.53,
+        "line_total": 90877.65
+      },
+      {
+        "line_item_id": "LIN000002",
+        "transaction_id": "TRX00001",
+        "product_id": "PRD0293",
+        "quantity": 5,
+        "unit_price": 14443.2,
+        "line_total": 72216.0
+      }
+    ]
+  },
+  "Inventory_Movements": {
+    "rows": 1800,
+    "columns": [
+      "movement_id",
+      "product_id",
+      "movement_date",
+      "movement_type",
+      "quantity",
+      "warehouse_id",
+      "reference_no"
+    ],
+    "dtypes": {
+      "movement_id": "object",
+      "product_id": "object",
+      "movement_date": "object",
+      "movement_type": "object",
+      "quantity": "int64",
+      "warehouse_id": "object",
+      "reference_no": "object"
+    },
+    "null_counts": {
+      "movement_id": 0,
+      "product_id": 0,
+      "movement_date": 0,
+      "movement_type": 0,
+      "quantity": 0,
+      "warehouse_id": 0,
+      "reference_no": 0
+    },
+    "sample": [
+      {
+        "movement_id": "MOV00001",
+        "product_id": "PRD0229",
+        "movement_date": "2026-07-24",
+        "movement_type": "Sale",
+        "quantity": 76,
+        "warehouse_id": "WH04",
+        "reference_no": "REF000001"
+      },
+      {
+        "movement_id": "MOV00002",
+        "product_id": "PRD0098",
+        "movement_date": "2026-10-13",
+        "movement_type": "Return",
+        "quantity": 146,
+        "warehouse_id": "WH02",
+        "reference_no": "REF000002"
+      }
+    ]
+  },
+  "Expenses": {
+    "rows": 600,
+    "columns": [
+      "expense_id",
+      "expense_date",
+      "store_id",
+      "category",
+      "amount",
+      "vendor"
+    ],
+    "dtypes": {
+      "expense_id": "object",
+      "expense_date": "object",
+      "store_id": "object",
+      "category": "object",
+      "amount": "float64",
+      "vendor": "object"
+    },
+    "null_counts": {
+      "expense_id": 0,
+      "expense_date": 0,
+      "store_id": 0,
+      "category": 0,
+      "amount": 0,
+      "vendor": 0
+    },
+    "sample": [
+      {
+        "expense_id": "REX0001",
+        "expense_date": "2026-08-26",
+        "store_id": "STR12",
+        "category": "Utilities",
+        "amount": 35242.29,
+        "vendor": "Vendor 019"
+      },
+      {
+        "expense_id": "REX0002",
+        "expense_date": "2026-05-05",
+        "store_id": "STR08",
+        "category": "Packaging",
+        "amount": 74929.43,
+        "vendor": "Vendor 089"
+      }
+    ]
+  },
+  "README": {
+    "rows": 6,
+    "columns": [
+      "Field",
+      "Details"
+    ],
+    "dtypes": {
+      "Field": "object",
+      "Details": "object"
+    },
+    "null_counts": {
+      "Field": 0,
+      "Details": 0
+    },
+    "sample": [
+      {
+        "Field": "Dataset",
+        "Details": "Retail sales, customer, product, inventory and expense intelligence."
+      },
+      {
+        "Field": "Data type",
+        "Details": "Synthetic demonstration data; not real people or organizations"
+      }
+    ]
+  }
+}

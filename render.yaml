@@ -1,0 +1,28 @@
+databases:
+  - name: retail-bi-db
+    databaseName: retail_bi
+    user: retail_admin
+    region: frankfurt
+    plan: free
+
+services:
+  - type: web
+    name: retail-bi-backend
+    env: python
+    region: frankfurt
+    plan: free
+    buildCommand: "pip install -r requirements.txt && python backend/init_db.py"
+    startCommand: "uvicorn backend.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: retail-bi-db
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: LLM_MODEL
+        value: gemini-1.5-flash
+      - key: GEMINI_API_KEY
+        sync: false
