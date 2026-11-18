@@ -1,5 +1,7 @@
 import os
 from datetime import datetime
+from typing import Optional
+from xml.sax.saxutils import escape
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -23,7 +25,9 @@ class PDFReportService:
         store_data: list,
         stockout_data: list,
         strategy_text: str,
-        verification_text: str
+        verification_text: str,
+        strategy_plan: Optional[dict] = None,
+        scorecard: Optional[dict] = None
     ) -> str:
         filename = f"Business_Intelligence_Report_Session_{session_id}.pdf"
         file_path = os.path.join(self.reports_dir, filename)
@@ -112,9 +116,11 @@ class PDFReportService:
             f"<b>₹{kpi_data['net_revenue']:,.2f}</b> in completed net revenue across <b>{kpi_data['completed_orders']:,}</b> orders, "
             f"generating a Gross Profit of <b>₹{kpi_data['gross_profit']:,.2f}</b> at a <b>{kpi_data['gross_profit_margin_pct']}%</b> gross margin. "
             f"However, cumulative store operating expenses totaled <b>₹{kpi_data['total_operating_expenses']:,.2f}</b>, "
-            f"resulting in a net operating loss of <b>-₹{abs(kpi_data['net_operating_profit']):,.2f}</b> (-3.57% operating margin). "
-            f"The primary driver of lost profitability is a staggering <b>50.24% order non-fulfillment leakage</b>: 645 orders were returned (₹54.54M lost) "
-            f"and 611 orders were cancelled (₹51.35M lost). Addressing digital channel return leakage and deficit store expenses will restore profitability."
+            f"resulting in an operating {'profit' if kpi_data['net_operating_profit'] >= 0 else 'loss'} of "
+            f"<b>₹{abs(kpi_data['net_operating_profit']):,.2f}</b> ({kpi_data['operating_margin_pct']}% operating margin). "
+            f"{kpi_data['returned_orders']:,} orders were returned (₹{kpi_data['returned_revenue_lost']:,.2f} lost) and "
+            f"{kpi_data['cancelled_orders']:,} were cancelled (₹{kpi_data['cancelled_revenue_lost']:,.2f} lost), a combined "
+            f"<b>{kpi_data['order_return_rate_pct'] + kpi_data['order_cancellation_rate_pct']:.2f}%</b> of placed orders."
         )
         elements.append(Paragraph(summary_p, body_style))
 
@@ -316,36 +322,60 @@ class PDFReportService:
         # --- Strategic Recommendations ---
         elements.append(Spacer(1, 10))
         elements.append(Paragraph("6. Prioritized Strategic Turnaround Actions", section_style))
-        recs = [
-            "<b>Pillar 1 (Operations):</b> Enact digital pre-dispatch verification for orders >₹50K to lower digital return rates from 28.5% to 16% (Recovers ~₹22M).",
-            "<b>Pillar 2 (Finance):</b> Restructure logistics and packaging contracts in stores STR03, STR09, and STR13 to eliminate ₹2.4M in store-level operating deficits.",
-            "<b>Pillar 3 (Marketing):</b> Launch a dedicated B2B Wholesale account program in Surat, Mumbai, and Rajkot to expand customer retention from 46.1% to 58%.",
-            "<b>Pillar 4 (Procurement):</b> Issue emergency replenishment orders for the 15 depleted SKUs to safeguard ₹8.4M in projected Q4 revenue."
-        ]
-        for r in recs:
-            elements.append(Paragraph(f"• {r}", body_style))
+        plan = strategy_plan or {}
+        for r in plan.get("recommendations", []):
+            elements.append(Paragraph(
+                f"• <b>({escape(str(r.get('category', '')))})</b> <b>{escape(str(r.get('title', '')))}</b>: "
+                f"{escape(str(r.get('description', '')))} "
+                f"<i>Expected impact: {escape(str(r.get('expected_roi', 'n/a')))}; "
+                f"risk: {escape(str(r.get('risk_level', 'n/a')))}. Pending manager approval.</i>",
+                body_style))
+        if not plan.get("recommendations"):
+            elements.append(Paragraph(escape(strategy_text or "No verified recommendations."), body_style))
+        for title, key in (("Growth Opportunities", "growth_opportunities"),
+                           ("Business Risks", "business_risks")):
+            items = plan.get(key) or []
+            if items:
+                elements.append(Spacer(1, 6))
+                elements.append(Paragraph(f"<b>{title}</b>", body_bold))
+                for it in items:
+                    elements.append(Paragraph(f"• {escape(str(it))}", body_style))
+        if plan.get("improvement_plan"):
+            elements.append(Spacer(1, 6))
+            elements.append(Paragraph("<b>90-Day Improvement Plan</b>", body_bold))
+            for ph in plan["improvement_plan"]:
+                if isinstance(ph, dict):
+                    acts = "; ".join(escape(str(x)) for x in ph.get("actions", []))
+                    elements.append(Paragraph(
+                        f"<b>{escape(str(ph.get('phase', '')))}</b> "
+                        f"(owner: {escape(str(ph.get('owner', 'n/a')))}): {acts}", body_style))
 
         # --- Verification Sign-Off Box ---
         elements.append(Spacer(1, 12))
+        sc = scorecard or {}
+        approved = sc.get("final_verdict") == "APPROVED"
+        colour = '#059669' if approved else '#DC2626'
+        if sc:
+            status_line = (
+                f"<b>Verification Status:</b> <font color='{colour}'>{escape(str(sc.get('final_verdict')))}</font><br/>"
+                f"Automated audit: {sc.get('verified_claims')} of {sc.get('claims_checked')} figures in the analyst "
+                f"reports matched database values ({sc.get('mathematical_accuracy_pct')}% accuracy, threshold "
+                f"{sc.get('accuracy_threshold_pct')}%). Unverified figures: {sc.get('hallucination_count')}. "
+                f"Correction rounds: {sc.get('correction_rounds')}. Verification Agent verdict: "
+                f"{escape(str(sc.get('agent_verdict')))} (confidence {escape(str(sc.get('agent_confidence')))}).<br/>"
+                f"{escape(str(sc.get('agent_rationale', '')))}"
+            )
+        else:
+            status_line = escape(verification_text or "No verification data available.")
         verif_box_data = [
-            [
-                Paragraph("<b>MATHEMATICAL AUDIT & VERIFICATION CERTIFICATION</b>", body_bold)
-            ],
-            [
-                Paragraph(
-                    "<b>Certification Status:</b> <font color='#059669'>100% MATHEMATICALLY VERIFIED</font><br/>"
-                    "All 9 core financial assertions (Net Revenue, Gross Profit, Margins, OpEx, Returns, Customer Retention) "
-                    "were cross-checked against source database records using deterministic Python & SQL calculation tools. "
-                    "Zero hallucinations detected. Final report certified for board presentation.",
-                    callout_style
-                )
-            ]
+            [Paragraph("<b>VERIFICATION AUDIT RESULT</b>", body_bold)],
+            [Paragraph(status_line, callout_style)],
         ]
         verif_table = Table(verif_box_data, colWidths=[540])
         verif_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#E2E8F0')),
-            ('BACKGROUND', (0, 1), (-1, 1), colors.HexColor('#F0FDF4')),
-            ('BOX', (0, 0), (-1, -1), 1, colors.HexColor('#059669')),
+            ('BACKGROUND', (0, 1), (-1, 1), colors.HexColor('#F0FDF4' if approved else '#FEF2F2')),
+            ('BOX', (0, 0), (-1, -1), 1, colors.HexColor(colour)),
             ('PADDING', (0, 0), (-1, -1), 6),
         ]))
         elements.append(verif_table)

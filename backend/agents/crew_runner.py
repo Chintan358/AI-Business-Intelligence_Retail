@@ -1,30 +1,245 @@
+"""
+Multi-agent execution pipeline (CrewAI).
+
+Workflow (matches Section 7 of the project requirements)
+    Phase 1  Data Analyst -> Marketing -> Finance -> Operations -> Strategy
+             One CrewAI Crew, Process.sequential. Each task receives the earlier
+             agents' outputs through `context`, so agents genuinely share results.
+    Phase 2  Deterministic audit: every number in the analyst reports is compared
+             with values computed from the database (verification.py), and every
+             recommendation's cited evidence is checked against real KPIs.
+    Phase 3  Correction loop: reports with unverified numbers are sent back to
+             their author agent; the Strategy Agent then rebuilds the plan.
+    Phase 4  Verification Agent (LLM) reviews the plan and the audit and returns
+             APPROVED / REJECTED. A report is approved only if BOTH the agent and the
+             deterministic audit pass.
+    Phase 5  Human-in-the-loop: only verified recommendations get an
+             ApprovalRequest. Nothing is executed without a manager's decision.
+
+If no LLM is configured the session fails with a clear message. The pipeline never
+substitutes canned text for agent output.
+"""
+import json
 import os
 import time
-import json
 from datetime import datetime
-from sqlalchemy.orm import Session
+from typing import Any, Dict, List, Optional
+
+from crewai import Crew, Process
+
+from backend.agents.definitions import create_agents
+from backend.agents.llm_provider import get_llm
+from backend.agents.tasks import (
+    create_correction_task,
+    create_strategy_revision_task,
+    create_tasks,
+    create_verification_task,
+)
+from backend.agents.verification import (
+    audit_reports,
+    build_ground_truth,
+    extract_json,
+    validate_recommendation,
+)
 from backend.database import SessionLocal
 from backend.models import (
-    AnalysisSession,
     AgentLog,
-    StrategicRecommendation,
+    AnalysisSession,
     ApprovalRequest,
-    GeneratedReport
+    GeneratedReport,
+    StrategicRecommendation,
 )
 from backend.services.kpi_service import KPIService
 from backend.services.pdf_report_service import PDFReportService
-from backend.agents.definitions import create_agents
-from backend.agents.tasks import create_tasks
-from backend.agents.llm_provider import get_llm
-from backend.config import settings
 
+MIN_AUDIT_ACCURACY = float(os.getenv("MIN_AUDIT_ACCURACY", "90"))
+MAX_CORRECTION_ROUNDS = int(os.getenv("MAX_CORRECTION_ROUNDS", "2"))
+CREW_MAX_RPM = int(os.getenv("CREW_MAX_RPM", "10"))  # protects free-tier LLM quotas
+
+# key, display name, task name (order = execution order)
+PIPELINE = [
+    ("data_analyst", "Data Analyst Agent", "Analyze Retail KPIs & Monthly Trajectory"),
+    ("marketing_agent", "Marketing Agent", "Customer Cohorts, Retention & Channel Behaviour"),
+    ("finance_agent", "Finance Agent", "Financial P&L, Operating Margin & Cost Optimization"),
+    ("operations_agent", "Operations Agent", "Inventory Health, Stockouts & Product Velocity"),
+    ("strategy_agent", "Strategy Agent", "Consolidated Improvement Plan & Recommendations"),
+    ("verification_agent", "Verification Agent", "Numeric Audit, Hallucination Check & Approval"),
+]
+ANALYSIS_KEYS = [k for k, _, _ in PIPELINE[:5]]
+DESCRIPTIVE_KEYS = ["data_analyst", "marketing_agent", "finance_agent", "operations_agent"]
+_META = {k: (name, task) for k, name, task in PIPELINE}
+VALID_CATEGORIES = {"Marketing", "Finance", "Operations", "Strategy"}
+VALID_RISK = {"Low", "Medium", "High"}
+
+
+class LLMNotConfiguredError(RuntimeError):
+    pass
+
+
+# --------------------------------------------------------------------------- #
+# Execution tracking (agent-wise logs shown on the frontend monitor)
+# --------------------------------------------------------------------------- #
+class ExecutionTracker:
+    def __init__(self, db, session_id: int, agents: dict):
+        self.db = db
+        self.session_id = session_id
+        self.agents = agents
+        self.logs: Dict[str, AgentLog] = {}
+        self.started: Dict[str, float] = {}
+        self.tool_calls: Dict[str, List[dict]] = {}
+        self.current: Optional[str] = None
+
+    def start(self, key: str) -> None:
+        name, task = _META[key]
+        log = AgentLog(
+            session_id=self.session_id,
+            agent_name=name,
+            agent_role=self.agents[key].role,
+            task_name=task,
+            status="Running",
+            started_at=datetime.utcnow(),
+        )
+        self.db.add(log)
+        self.db.commit()
+        self.logs[key] = log
+        self.started[key] = time.time()
+        self.tool_calls[key] = []
+        self.current = key
+
+    def record_tool(self, tool_name: str, tool_input: str) -> None:
+        if self.current:
+            self.tool_calls.setdefault(self.current, []).append(
+                {"tool": tool_name, "input": tool_input[:300]}
+            )
+
+    def complete(self, key: str, output: str, structured: Optional[dict] = None) -> None:
+        log = self.logs[key]
+        log.status = "Completed"
+        log.completed_at = datetime.utcnow()
+        log.execution_duration_sec = round(time.time() - self.started[key], 2)
+        log.output_text = output
+        data = dict(structured or {})
+        data["tool_calls"] = self.tool_calls.get(key, [])
+        log.structured_data = data
+        self.db.commit()
+
+    def revise(self, key: str, output: str, correction: dict) -> None:
+        """Agent re-ran after the audit; keep the history of corrections."""
+        log = self.logs[key]
+        data = dict(log.structured_data or {})
+        data.setdefault("corrections", []).append(correction)
+        data["tool_calls"] = self.tool_calls.get(key, [])
+        log.output_text = output
+        log.structured_data = data
+        log.execution_duration_sec = round(time.time() - self.started[key], 2)
+        self.db.commit()
+
+    def fail_running(self, message: str) -> None:
+        for key, log in self.logs.items():
+            if log.status == "Running":
+                log.status = "Failed"
+                log.error_message = message[:1000]
+                log.completed_at = datetime.utcnow()
+                log.execution_duration_sec = round(time.time() - self.started[key], 2)
+        self.db.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def _snapshot(key: str, d: Dict[str, Any]) -> dict:
+    """Database-derived data stored next to each agent's output (not LLM text)."""
+    if key == "data_analyst":
+        return {"executive_kpis": d["exec_kpis"], "monthly_trends": d["monthly"],
+                "category_performance": d["category"]}
+    if key == "marketing_agent":
+        return {"segments": d["segments"], "channels": d["channel"],
+                "repeat_rate_pct": d["exec_kpis"]["repeat_purchase_rate_pct"]}
+    if key == "finance_agent":
+        return {"gross_profit": d["exec_kpis"]["gross_profit"],
+                "gross_margin_pct": d["exec_kpis"]["gross_profit_margin_pct"],
+                "total_opex": d["exec_kpis"]["total_operating_expenses"],
+                "operating_profit": d["exec_kpis"]["net_operating_profit"],
+                "store_pnl": d["store"]}
+    if key == "operations_agent":
+        return {"stockout_alerts": d["stock_alerts"], "top_and_slow_products": d["top_slow"]}
+    return {}
+
+
+def _run_single(agent, task, step_cb) -> str:
+    """Runs one task with one agent as its own Crew (used for corrections/verification)."""
+    crew = Crew(
+        agents=[agent], tasks=[task], process=Process.sequential,
+        verbose=True, max_rpm=CREW_MAX_RPM, step_callback=step_cb,
+    )
+    return crew.kickoff().raw
+
+
+def _normalise_recommendations(plan: dict) -> List[dict]:
+    recs = []
+    for r in (plan.get("recommendations") or [])[:6]:
+        if not isinstance(r, dict) or not r.get("title") or not r.get("description"):
+            continue
+        category = str(r.get("category", "Strategy")).strip().title()
+        risk = str(r.get("risk_level", "Medium")).strip().title()
+        recs.append({
+            "title": str(r["title"])[:250],
+            "category": category if category in VALID_CATEGORIES else "Strategy",
+            "description": str(r["description"]),
+            "expected_roi": str(r.get("expected_roi", "Not quantified"))[:120],
+            "risk_level": risk if risk in VALID_RISK else "Medium",
+            "evidence_metrics": r.get("evidence_metrics"),
+        })
+    return recs
+
+
+def _format_strategy_text(plan: dict) -> str:
+    lines = [str(plan.get("executive_summary", "")).strip(), ""]
+    for title, key in (("Growth opportunities", "growth_opportunities"),
+                       ("Business risks", "business_risks")):
+        items = plan.get(key) or []
+        if items:
+            lines.append(f"{title}:")
+            lines += [f"- {i}" for i in items]
+            lines.append("")
+    if plan.get("improvement_plan"):
+        lines.append("90-day improvement plan:")
+        for ph in plan["improvement_plan"]:
+            if isinstance(ph, dict):
+                lines.append(f"{ph.get('phase', '')} (owner: {ph.get('owner', 'n/a')})")
+                lines += [f"  - {a}" for a in ph.get("actions", [])]
+    return "\n".join(lines).strip()
+
+
+def _format_verification_text(sc: dict) -> str:
+    lines = [
+        f"FINAL VERDICT: {sc['final_verdict']}",
+        f"- Numeric audit: {sc['verified_claims']} of {sc['claims_checked']} figures matched the "
+        f"database ({sc['mathematical_accuracy_pct']}% accuracy; threshold {sc['accuracy_threshold_pct']}%).",
+        f"- Figures that could not be verified: {sc['hallucination_count']}.",
+        f"- Correction rounds used: {sc['correction_rounds']}.",
+        f"- Verification Agent verdict: {sc['agent_verdict']} (confidence: {sc['agent_confidence']}).",
+    ]
+    for label, key in (("Unsupported claims", "unsupported_claims"),
+                       ("Contradictions", "contradictions"),
+                       ("Low-confidence findings", "low_confidence_findings")):
+        if sc.get(key):
+            lines.append(f"- {label}: " + "; ".join(map(str, sc[key])))
+    if sc.get("blocked_recommendations"):
+        lines.append("- Recommendations withheld from approval (evidence failed): "
+                     + "; ".join(sc["blocked_recommendations"]))
+    if sc.get("agent_rationale"):
+        lines.append(f"- Rationale: {sc['agent_rationale']}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Main entry point (called as a FastAPI BackgroundTask)
+# --------------------------------------------------------------------------- #
 def run_multi_agent_analysis(session_id: int):
-    """
-    Executes the six-agent CrewAI pipeline for the given analysis session.
-    Logs execution progress in real-time, generates recommendations,
-    creates human approval requests, verifies outputs, and generates PDF reports.
-    """
     db = SessionLocal()
+    session = None
+    tracker: Optional[ExecutionTracker] = None
     try:
         session = db.query(AnalysisSession).filter(AnalysisSession.id == session_id).first()
         if not session:
@@ -34,384 +249,277 @@ def run_multi_agent_analysis(session_id: int):
         session.status = "Running"
         session.started_at = datetime.utcnow()
         db.commit()
+        t_start = time.time()
 
-        start_time_all = time.time()
-        kpi_service = KPIService(db)
-        exec_kpis = kpi_service.get_executive_kpis()
-        monthly_trends = kpi_service.get_monthly_metrics()
-        category_perf = kpi_service.get_category_performance()
-        channel_perf = kpi_service.get_channel_performance()
-        store_perf = kpi_service.get_store_performance()
-        segment_insights = kpi_service.get_customer_segment_insights()
-        stock_alerts = kpi_service.get_stockout_alerts(limit=15)
-        top_slow = kpi_service.get_top_selling_and_slow_moving_products(limit=10)
-
-        # Check if LLM is configured
         llm = get_llm()
-        has_active_llm = llm is not None
+        if llm is None:
+            raise LLMNotConfiguredError(
+                "No LLM is configured. Set GEMINI_API_KEY (and LLM_PROVIDER=gemini) or "
+                "OPENAI_API_KEY on the backend and run the analysis again."
+            )
 
-        agent_results = {}
-
-        # -------------------------------------------------------------
-        # 1. Agent 1: Data Analyst Agent
-        # -------------------------------------------------------------
-        t0 = time.time()
-        log1 = AgentLog(
-            session_id=session_id,
-            agent_name="Data Analyst Agent",
-            agent_role="Principal Retail Data Analyst",
-            task_name="Analyze Retail KPIs & Monthly Trajectory",
-            status="Running",
-            started_at=datetime.utcnow()
-        )
-        db.add(log1)
-        db.commit()
-
-        analysis_summary = (
-            f"Dataset Period: May 1, 2026 – October 31, 2026 (184 Days).\n"
-            f"1. Top-Line Metrics: Analyzed 2,500 total orders. Realized Net Revenue is ₹{exec_kpis['net_revenue']:,.2f} "
-            f"across 1,244 completed transactions with total discounts of ₹{exec_kpis['discount_amount']:,.2f}. "
-            f"Average Order Value (AOV) is ₹{exec_kpis['aov']:,.2f} and total volume sold reached {exec_kpis['total_units_sold']:,} units.\n"
-            f"2. Monthly Trajectory: Sales grew consistently from May (₹15.53M) through August (₹20.42M). "
-            f"In September, net revenue experienced a significant contraction of -14.01% to ₹17.56M, driven by inventory stockouts "
-            f"in high-demand grocery and electronics SKUs, before rebounding by +21.93% in October to ₹21.41M (peak month).\n"
-            f"3. Merchandise Department Breakdown: Grocery generated ₹31.28M (28.5% share), Electronics ₹29.14M (26.5% share), "
-            f"Home ₹25.82M (23.5% share), and Fashion ₹23.60M (21.5% share).\n"
-            f"4. Fulfillment Anomaly: Out of 2,500 placed transactions, 645 were Returned (25.80%) and 611 were Cancelled (24.44%). "
-            f"The combined pipeline leakage of 50.24% resulted in over ₹105.89M in lost gross sales."
-        )
-
-        log1.status = "Completed"
-        log1.completed_at = datetime.utcnow()
-        log1.execution_duration_sec = round(time.time() - t0, 2)
-        log1.output_text = analysis_summary
-        log1.structured_data = {
-            "executive_kpis": exec_kpis,
-            "monthly_trends": monthly_trends,
-            "category_performance": category_perf
+        # ---- Ground truth from the database (never from the LLM) -------------
+        kpi = KPIService(db)
+        data = {
+            "exec_kpis": kpi.get_executive_kpis(),
+            "monthly": kpi.get_monthly_metrics(),
+            "category": kpi.get_category_performance(),
+            "channel": kpi.get_channel_performance(),
+            "store": kpi.get_store_performance(),
+            "segments": kpi.get_customer_segment_insights(),
+            "stock_alerts": kpi.get_stockout_alerts(limit=15),
+            "top_slow": kpi.get_top_selling_and_slow_moving_products(limit=10),
         }
-        db.commit()
-        agent_results["data_analyst"] = analysis_summary
-
-        # -------------------------------------------------------------
-        # 2. Agent 2: Marketing Agent
-        # -------------------------------------------------------------
-        t0 = time.time()
-        log2 = AgentLog(
-            session_id=session_id,
-            agent_name="Marketing Agent",
-            agent_role="Chief Retail Marketing Strategist",
-            task_name="Customer Cohorts, Retention & Return Leakage",
-            status="Running",
-            started_at=datetime.utcnow()
+        row_counts = {name: len(df) for name, df in kpi.get_raw_dataframes().items()}
+        truth = build_ground_truth(
+            data["exec_kpis"],
+            {k: v for k, v in data.items() if k != "exec_kpis"},
+            row_counts,
         )
-        db.add(log2)
-        db.commit()
+        metric_keys = list(truth["kpis"].keys()) + list(truth["derived"].keys())
 
-        marketing_summary = (
-            f"1. Customer Segmentation: Customer base comprises 1,200 registered accounts (325 Regular, 302 New, 292 Wholesale, 281 Premium). "
-            f"Among completed orders, Wholesale buyers account for the highest AOV (₹98,420), followed by Premium (₹91,240). "
-            f"Surat, Mumbai, and Rajkot exhibit the highest concentration of high-ticket repeat orders.\n"
-            f"2. Retention & Repeat Purchasing: 739 unique customers completed at least one order. Of these, 341 customers placed 2 or more orders, "
-            f"yielding a 46.14% repeat purchase rate. However, customer drop-off is elevated after the first purchase for 'New' segment accounts.\n"
-            f"3. Channel Return Leakage Assessment: Digital channels demonstrate severe leakage compared to physical stores. "
-            f"In-store return rate is 21.2%, while Online returns stand at 28.9% and Mobile App returns at 27.6%. "
-            f"Discount-seeking behavior is heavily correlated with returns: orders with >10% discount experience a 36.4% return rate.\n"
-            f"4. Strategic Marketing Recommendations: Introduce dedicated B2B Wholesale account management in western hubs, "
-            f"institute a 5% restocking fee on non-defective digital electronics returns, and recalibrate promotional discounts."
+        agents = create_agents(llm)
+        tasks = create_tasks(agents, metric_keys)
+        tracker = ExecutionTracker(db, session_id, agents)
+
+        def step_cb(step):  # records which tools each agent actually called
+            tool = getattr(step, "tool", None)
+            if tool:
+                tracker.record_tool(str(tool), str(getattr(step, "tool_input", "")))
+
+        # ---- Phase 1: sequential crew with shared context --------------------
+        def make_callback(idx: int):
+            key = ANALYSIS_KEYS[idx]
+
+            def _cb(output):
+                tracker.complete(key, getattr(output, "raw", str(output)), _snapshot(key, data))
+                if idx + 1 < len(ANALYSIS_KEYS):
+                    tracker.start(ANALYSIS_KEYS[idx + 1])
+            return _cb
+
+        for i, t in enumerate(tasks):
+            t.callback = make_callback(i)
+
+        crew = Crew(
+            agents=[agents[k] for k in ANALYSIS_KEYS],
+            tasks=tasks,
+            process=Process.sequential,
+            verbose=True,
+            max_rpm=CREW_MAX_RPM,
+            step_callback=step_cb,
         )
+        tracker.start(ANALYSIS_KEYS[0])
+        result = crew.kickoff()
+        raw_outputs = [o.raw for o in result.tasks_output]
+        reports = dict(zip(ANALYSIS_KEYS, raw_outputs))
+        plan = extract_json(reports["strategy_agent"])
 
-        log2.status = "Completed"
-        log2.completed_at = datetime.utcnow()
-        log2.execution_duration_sec = round(time.time() - t0, 2)
-        log2.output_text = marketing_summary
-        log2.structured_data = {
-            "segments": segment_insights,
-            "channels": channel_perf,
-            "repeat_rate_pct": exec_kpis["repeat_purchase_rate_pct"]
+        def revise_strategy(issues: List[str]) -> Optional[dict]:
+            tracker.current = "strategy_agent"
+            raw = _run_single(
+                agents["strategy_agent"],
+                create_strategy_revision_task(
+                    agents["strategy_agent"],
+                    {k: reports[k] for k in DESCRIPTIVE_KEYS}, issues, metric_keys),
+                step_cb,
+            )
+            return extract_json(raw)
+
+        if plan is None:  # one retry if the JSON was malformed
+            plan = revise_strategy(["Your output was not a single valid JSON object."])
+        if plan is None:
+            raise ValueError("Strategy Agent did not return valid JSON after a retry.")
+
+        # ---- Phases 2-3: deterministic audit + correction loop ---------------
+        tracker.start("verification_agent")
+        corrections: List[dict] = []
+        audit: Dict[str, Any] = {}
+        recs: List[dict] = []
+        rec_checks: List[dict] = []
+        for round_no in range(MAX_CORRECTION_ROUNDS + 1):
+            audit = audit_reports({k: reports[k] for k in DESCRIPTIVE_KEYS}, truth)
+            recs = _normalise_recommendations(plan)
+            rec_checks = [validate_recommendation(r, truth) for r in recs]
+            bad = [i for i, c in enumerate(rec_checks) if not c["all_valid"]]
+            # Any unverifiable figure sends the report back to its author; the
+            # accuracy threshold is the final approval gate, not the retry trigger.
+            if audit["unverified_count"] == 0 and not bad:
+                break
+            if round_no == MAX_CORRECTION_ROUNDS:
+                break
+
+            issues: List[str] = []
+            if audit["unverified_count"] > 0:
+                by_agent: Dict[str, List[dict]] = {}
+                for c in audit["unverified_claims"]:
+                    by_agent.setdefault(c["agent"], []).append(c)
+                for key, claims in by_agent.items():
+                    tracker.current = key
+                    reports[key] = _run_single(
+                        agents[key],
+                        create_correction_task(agents[key], reports[key], claims),
+                        step_cb,
+                    )
+                    note = {"round": round_no + 1, "unverified_numbers_sent_back": len(claims)}
+                    corrections.append({"agent": key, **note})
+                    tracker.revise(key, reports[key], note)
+                    issues.append(f"{_META[key][0]} report was corrected ({len(claims)} unverified numbers).")
+            for i in bad:
+                issues.append(f"Recommendation '{recs[i]['title']}' has missing or incorrect evidence_metrics.")
+            new_plan = revise_strategy(issues)
+            if new_plan is not None:
+                plan = new_plan
+                tracker.revise("strategy_agent", _format_strategy_text(plan),
+                               {"round": round_no + 1, "reason": issues})
+
+        # Recommendations whose evidence still fails are withheld from approval.
+        valid_recs = [r for r, c in zip(recs, rec_checks) if c["all_valid"]]
+        valid_checks = [c for c in rec_checks if c["all_valid"]]
+        blocked = [(r, c) for r, c in zip(recs, rec_checks) if not c["all_valid"]]
+        plan["recommendations"] = valid_recs
+
+        # ---- Phase 4: Verification Agent (LLM) --------------------------------
+        tracker.current = "verification_agent"
+        audit_summary = {
+            "accuracy_pct": audit["accuracy_pct"],
+            "claims_checked": audit["claims_checked"],
+            "unverified_count": audit["unverified_count"],
+            "per_agent": audit["per_agent"],
+            "unverified_claims": [
+                {"agent": c["agent"], "claim": c["claim"], "sentence": c["context"]}
+                for c in audit["unverified_claims"][:15]
+            ],
+            "correction_rounds": len({c["round"] for c in corrections}),
+            "recommendations_withheld_for_bad_evidence": [r["title"] for r, _ in blocked],
         }
-        db.commit()
-        agent_results["marketing_agent"] = marketing_summary
-
-        # -------------------------------------------------------------
-        # 3. Agent 3: Finance Agent
-        # -------------------------------------------------------------
-        t0 = time.time()
-        log3 = AgentLog(
-            session_id=session_id,
-            agent_name="Finance Agent",
-            agent_role="Retail Financial Controller",
-            task_name="Financial P&L, Operating Margin & Cost Rationalization",
-            status="Running",
-            started_at=datetime.utcnow()
+        raw_verdict = _run_single(
+            agents["verification_agent"],
+            create_verification_task(agents["verification_agent"],
+                                     json.dumps(plan, indent=2)[:14000], audit_summary),
+            step_cb,
         )
-        db.add(log3)
-        db.commit()
-
-        finance_summary = (
-            f"1. Profit & Loss Statement: Completed Net Revenue of ₹{exec_kpis['net_revenue']:,.2f} minus Cost of Goods Sold (COGS) "
-            f"of ₹{exec_kpis['cogs']:,.2f} yields a Gross Profit of ₹{exec_kpis['gross_profit']:,.2f} with a Gross Margin of {exec_kpis['gross_profit_margin_pct']}%. "
-            f"Fashion department attained the highest gross margin (28.4%), while Grocery operated at 17.8%.\n"
-            f"2. Operating Expenses Audit: Total store OpEx reached ₹{exec_kpis['total_operating_expenses']:,.2f} across 6 categories: "
-            f"Marketing (₹5.32M, 18.9%), Rent (₹5.23M, 18.6%), Staff Salaries (₹4.81M, 17.1%), Logistics (₹4.45M, 15.8%), "
-            f"Packaging (₹4.38M, 15.6%), and Utilities (₹3.91M, 13.9%).\n"
-            f"3. Operational Deficit Diagnosis: Because operating expenses exceeded gross profit, the enterprise suffered a Net Operating Loss "
-            f"of -₹{abs(exec_kpis['net_operating_profit']):,.2f} (-3.57% operating margin). "
-            f"Store-level analysis reveals that stores STR03 (-₹920K), STR09 (-₹840K), and STR13 (-₹810K) account for 65% of the total deficit "
-            f"due to inflated third-party logistics and premium packaging contracts.\n"
-            f"4. Cost Optimization Roadmap: Cap store-level marketing spend to 12% of gross profit, renegotiate leases in underperforming branches, "
-            f"and renegotiate supplier margins on 20 low-margin SKUs."
+        verdict = extract_json(raw_verdict) or {}
+        agent_verdict = str(verdict.get("verdict", "REJECTED")).upper()  # fail closed
+        approved = (
+            agent_verdict == "APPROVED"
+            and audit["accuracy_pct"] >= MIN_AUDIT_ACCURACY
+            and len(valid_recs) >= 1
         )
 
-        log3.status = "Completed"
-        log3.completed_at = datetime.utcnow()
-        log3.execution_duration_sec = round(time.time() - t0, 2)
-        log3.output_text = finance_summary
-        log3.structured_data = {
-            "gross_profit": exec_kpis["gross_profit"],
-            "gross_margin_pct": exec_kpis["gross_profit_margin_pct"],
-            "total_opex": exec_kpis["total_operating_expenses"],
-            "operating_profit": exec_kpis["net_operating_profit"],
-            "store_pnl": store_perf
+        audited = audit["unverified_claims"][:15] + audit["verified_claims"]
+        scorecard = {
+            "audit_timestamp": datetime.utcnow().isoformat(),
+            "mathematical_accuracy_pct": audit["accuracy_pct"],
+            "accuracy_threshold_pct": MIN_AUDIT_ACCURACY,
+            "claims_checked": audit["claims_checked"],
+            "verified_claims": audit["verified_count"],
+            "hallucination_count": audit["unverified_count"],
+            "per_agent": audit["per_agent"],
+            "correction_rounds": len({c["round"] for c in corrections}),
+            "agent_corrections": len(corrections),
+            "corrections": corrections,
+            "agent_verdict": agent_verdict,
+            "agent_confidence": verdict.get("confidence", "Low"),
+            "agent_rationale": verdict.get("rationale", "Verification Agent returned no valid JSON."),
+            "unsupported_claims": verdict.get("unsupported_claims", []),
+            "contradictions": verdict.get("contradictions", []),
+            "low_confidence_findings": verdict.get("low_confidence_findings", []),
+            "consistency_rating": "HIGH" if not verdict.get("contradictions") else "LOW",
+            "audited_claims": [
+                {"claim": f"{c['claim']} ({_META[c['agent']][0]})",
+                 "ground_truth": c["ground_truth"], "match": c["match"]}
+                for c in audited[:25]
+            ],
+            "recommendation_evidence": [
+                {"title": r["title"], **c} for r, c in zip(valid_recs, valid_checks)
+            ],
+            "blocked_recommendations": [r["title"] for r, _ in blocked],
+            "unverified_claims_remaining": [
+                {"agent": _META[c["agent"]][0], "claim": c["claim"], "sentence": c["context"]}
+                for c in audit["unverified_claims"][:15]
+            ],
+            "recommendation_risk_assessment": (
+                f"{len(valid_recs)} recommendation(s) passed evidence checks; "
+                f"{len(blocked)} withheld."
+            ),
+            "final_verdict": "APPROVED" if approved else "REJECTED",
         }
-        db.commit()
-        agent_results["finance_agent"] = finance_summary
+        verification_text = _format_verification_text(scorecard)
+        tracker.complete("verification_agent", verification_text, scorecard)
 
-        # -------------------------------------------------------------
-        # 4. Agent 4: Operations Agent
-        # -------------------------------------------------------------
-        t0 = time.time()
-        log4 = AgentLog(
-            session_id=session_id,
-            agent_name="Operations Agent",
-            agent_role="VP of Retail Supply Chain",
-            task_name="Inventory Health, Stockouts & Logistics Velocity",
-            status="Running",
-            started_at=datetime.utcnow()
-        )
-        db.add(log4)
+        strategy_text = _format_strategy_text(plan)
+        # keep the readable plan (not raw JSON) in the Strategy agent's log
+        strategy_log = tracker.logs["strategy_agent"]
+        strategy_log.output_text = strategy_text
+        strategy_log.structured_data = {**(strategy_log.structured_data or {}),
+                                        "plan": plan}
         db.commit()
 
-        stockout_count = len(stock_alerts)
-        operations_summary = (
-            f"1. Warehouse & Inventory Audit: Evaluated 1,800 inventory movements across 8 fulfillment centers (WH01 - WH08). "
-            f"Current stock balances reveal that {stockout_count} priority SKUs are currently operating at or below designated safety reorder levels.\n"
-            f"2. Critical Stockout Hazards: Products requiring immediate emergency purchase orders include PRD0085 (Cookware Set 085, deficit: 38 units), "
-            f"PRD0192 (Jacket 192, deficit: 32 units), PRD0219 (Mixer Grinder 219, deficit: 29 units), and PRD0228 (Bluetooth Speaker 228, deficit: 25 units).\n"
-            f"3. Fulfillment Logistics Waste: Analysis of 347 warehouse stock transfer movements indicates excessive inter-state transit between "
-            f"Gujarat warehouses (WH01, WH04, WH06) and Maharashtra hubs (WH02, WH08). Cross-shipping contributed to ₹4.45M in logistics expenses "
-            f"and caused fulfillment delays leading to the September sales slump.\n"
-            f"4. Supply Chain Optimization: Establish regional fulfillment zoning restricting inter-facility transfers, "
-            f"automate automated purchase orders for all SKUs reaching reorder thresholds, and liquidate bottom 10 slow-moving items."
-        )
-
-        log4.status = "Completed"
-        log4.completed_at = datetime.utcnow()
-        log4.execution_duration_sec = round(time.time() - t0, 2)
-        log4.output_text = operations_summary
-        log4.structured_data = {
-            "stockout_alerts": stock_alerts,
-            "top_and_slow_products": top_slow
-        }
-        db.commit()
-        agent_results["operations_agent"] = operations_summary
-
-        # -------------------------------------------------------------
-        # 5. Agent 5: Strategy Agent
-        # -------------------------------------------------------------
-        t0 = time.time()
-        log5 = AgentLog(
-            session_id=session_id,
-            agent_name="Strategy Agent",
-            agent_role="Principal Turnaround Consultant",
-            task_name="Consolidated Turnaround Plan & Recommendations",
-            status="Running",
-            started_at=datetime.utcnow()
-        )
-        db.add(log5)
-        db.commit()
-
-        strategy_summary = (
-            f"EXECUTIVE TURNAROUND STRATEGY & IMPROVEMENT PLAN:\n"
-            f"The enterprise demonstrates robust consumer demand with ₹109.84M in net sales and a 22.02% gross margin, "
-            f"but faces severe profitability erosion caused by a 50.24% order return/cancellation rate, ₹28.11M in operating expenses, "
-            f"and logistics bottlenecks in stores STR03, STR09, and STR13.\n\n"
-            f"We propose a structured 90-day Retail Turnaround Action Plan across four strategic pillars:\n"
-            f"1. Operational Return Reduction: Revise digital return policies and introduce pre-dispatch verification to lower digital returns from 28.5% to 16% (Targeted recovery: ₹22M in net revenue).\n"
-            f"2. Store OpEx Rationalization: Re-negotiate vendor packaging contracts and consolidate delivery routes in deficit branches STR03, STR09, and STR13 (Targeted savings: ₹2.4M annualized).\n"
-            f"3. High-Value Wholesale Expansion: Implement a VIP Wholesale loyalty program in Surat, Mumbai, and Rajkot to capture recurring bulk orders (Projected ROI: +18% Wholesale volume).\n"
-            f"4. Inventory Replenishment & Stockout Prevention: Issue immediate POs for 15 depleted SKUs and enforce regional warehouse fulfillment zoning to avoid inter-state transfer delays."
-        )
-
-        log5.status = "Completed"
-        log5.completed_at = datetime.utcnow()
-        log5.execution_duration_sec = round(time.time() - t0, 2)
-        log5.output_text = strategy_summary
-        db.commit()
-        agent_results["strategy_agent"] = strategy_summary
-
-        # Create structured Strategic Recommendations for Human-in-the-Loop approval
-        recs_data = [
-            {
-                "title": "Enact Digital Return Policy Reform & Verification",
-                "category": "Operations",
-                "description": "Institute pre-shipment customer confirmation for online and mobile app orders exceeding ₹50,000 to curb the 28.5% digital return rate and recover estimated ₹22M in lost revenue.",
-                "expected_roi": "Estimated ₹14.5M - ₹22.0M realized sales recovery per half-year",
-                "risk_level": "Medium",
-                "supporting_evidence": {
-                    "returned_revenue_lost": exec_kpis["returned_revenue_lost"],
-                    "return_rate_pct": exec_kpis["order_return_rate_pct"]
-                }
-            },
-            {
-                "title": "OpEx Restructuring for Stores STR03, STR09, and STR13",
-                "category": "Finance",
-                "description": "Renegotiate third-party logistics and packaging contracts in stores STR03, STR09, and STR13 to eliminate ₹2.4M in store-level operating deficits and return stores to positive contribution margins.",
-                "expected_roi": "₹2,400,000 Annualized Direct Cost Reduction",
-                "risk_level": "Low",
-                "supporting_evidence": {
-                    "current_operating_deficit": exec_kpis["net_operating_profit"],
-                    "deficit_store_ids": ["STR03", "STR09", "STR13"]
-                }
-            },
-            {
-                "title": "Establish B2B Wholesale Accounts Program in Surat & Mumbai",
-                "category": "Marketing",
-                "description": "Reallocate 15% of digital marketing ad spend into dedicated B2B Wholesale field representatives in Surat, Mumbai, and Rajkot to boost repeat purchase rate from 46.1% to 58%.",
-                "expected_roi": "Estimated +18% Wholesale Volume (+₹4.2M Net Margin)",
-                "risk_level": "Low",
-                "supporting_evidence": {
-                    "current_repeat_rate": exec_kpis["repeat_purchase_rate_pct"],
-                    "wholesale_active_customers": 182
-                }
-            },
-            {
-                "title": "Emergency Procurement for 15 Depleted High-Velocity SKUs",
-                "category": "Operations",
-                "description": "Authorize purchase orders for 15 priority stockout SKUs (including PRD0085, PRD0192, PRD0219, and PRD0228) to prevent lost sales in upcoming Q4 demand cycles.",
-                "expected_roi": "Protection of ₹8.4M in projected monthly sales",
-                "risk_level": "Low",
-                "supporting_evidence": {
-                    "stockout_skus_count": stockout_count,
-                    "top_stockout_sku": "PRD0085"
-                }
-            }
-        ]
-
-        created_recs = []
-        for r_item in recs_data:
+        # ---- Phase 5: human-in-the-loop ----------------------------------------
+        created: List[StrategicRecommendation] = []
+        for r, c in [(r, c) for r, c in zip(valid_recs, valid_checks)] + blocked:
+            is_valid = c["all_valid"]
             rec = StrategicRecommendation(
                 session_id=session_id,
-                title=r_item["title"],
-                category=r_item["category"],
-                description=r_item["description"],
-                expected_roi=r_item["expected_roi"],
-                risk_level=r_item["risk_level"],
-                supporting_evidence=r_item["supporting_evidence"],
-                status="Pending"
+                title=r["title"],
+                category=r["category"],
+                description=r["description"],
+                expected_roi=r["expected_roi"],
+                risk_level=r["risk_level"],
+                supporting_evidence=c,  # database values, not LLM claims
+                status="Pending" if (approved and is_valid) else "Blocked",
             )
             db.add(rec)
             db.commit()
             db.refresh(rec)
+            if approved and is_valid:  # only verified items reach a manager
+                db.add(ApprovalRequest(recommendation_id=rec.id,
+                                       requested_by_agent="Strategy Agent",
+                                       decision="Pending"))
+                db.commit()
+            created.append(rec)
 
-            # Create ApprovalRequest for Human-in-the-Loop
-            app_req = ApprovalRequest(
-                recommendation_id=rec.id,
-                requested_by_agent="Strategy Agent",
-                decision="Pending"
-            )
-            db.add(app_req)
-            db.commit()
-            created_recs.append(rec)
-
-        # -------------------------------------------------------------
-        # 6. Agent 6: Verification Agent
-        # -------------------------------------------------------------
-        t0 = time.time()
-        log6 = AgentLog(
-            session_id=session_id,
-            agent_name="Verification Agent",
-            agent_role="Chief Audit & Verification Inspector",
-            task_name="Mathematical Verification & Compliance Audit",
-            status="Running",
-            started_at=datetime.utcnow()
-        )
-        db.add(log6)
-        db.commit()
-
-        scorecard = {
-            "audit_timestamp": datetime.utcnow().isoformat(),
-            "mathematical_accuracy_pct": 100.0,
-            "hallucination_count": 0,
-            "consistency_rating": "EXCELLENT",
-            "audited_claims": [
-                {"claim": "Net Revenue == ₹109,842,110.21", "ground_truth": exec_kpis["net_revenue"], "match": True},
-                {"claim": "Completed Orders == 1,244", "ground_truth": exec_kpis["completed_orders"], "match": True},
-                {"claim": "Gross Profit == ₹24,189,917.27", "ground_truth": exec_kpis["gross_profit"], "match": True},
-                {"claim": "Gross Margin == 22.02%", "ground_truth": exec_kpis["gross_profit_margin_pct"], "match": True},
-                {"claim": "Total OpEx == ₹28,107,904.22", "ground_truth": exec_kpis["total_operating_expenses"], "match": True},
-                {"claim": "Net Operating Loss == -₹3,917,986.95", "ground_truth": exec_kpis["net_operating_profit"], "match": True},
-                {"claim": "Return Rate == 25.80%", "ground_truth": exec_kpis["order_return_rate_pct"], "match": True},
-                {"claim": "Active Customers == 739", "ground_truth": exec_kpis["active_customers"], "match": True},
-                {"claim": "Repeat Purchase Rate == 46.14%", "ground_truth": exec_kpis["repeat_purchase_rate_pct"], "match": True}
-            ],
-            "recommendation_risk_assessment": "All 4 strategic proposals are supported by verifiable database records.",
-            "final_verdict": "APPROVED"
-        }
-
-        verification_text = (
-            f"VERIFICATION AUDIT CERTIFICATION:\n"
-            f"- Status: 100% MATHEMATICALLY VERIFIED AND APPROVED.\n"
-            f"- Audited 9 core financial claims against database ground truth. All 9 claims match with 0.00% variance.\n"
-            f"- No hallucinated customer metrics, inventory numbers, or imaginary expense figures detected.\n"
-            f"- The strategic turnaround proposals are logically and mathematically consistent with the operational deficit and return leakage data.\n"
-            f"- Report signed off and approved for executive review."
-        )
-
-        log6.status = "Completed"
-        log6.completed_at = datetime.utcnow()
-        log6.execution_duration_sec = round(time.time() - t0, 2)
-        log6.output_text = verification_text
-        log6.structured_data = scorecard
-        db.commit()
-        agent_results["verification_agent"] = verification_text
-
-        # Finalize Session Record
-        session.status = "Verified"
+        # ---- Finalise session ---------------------------------------------------
+        session.status = "Verified" if approved else "Completed"
+        session.is_verified = approved
         session.completed_at = datetime.utcnow()
-        session.execution_duration_sec = round(time.time() - start_time_all, 2)
-        session.executive_summary = strategy_summary
-        session.is_verified = True
+        session.execution_duration_sec = round(time.time() - t_start, 2)
+        session.executive_summary = str(plan.get("executive_summary", strategy_text))
         session.verification_scorecard = scorecard
         session.consolidated_plan = {
-            "executive_summary": strategy_summary,
-            "agent_results": agent_results,
-            "kpi_snapshot": exec_kpis,
-            "monthly_trends": monthly_trends,
-            "category_performance": category_perf,
-            "channel_performance": channel_perf,
+            "executive_summary": session.executive_summary,
+            "agent_results": {**reports, "strategy_agent": strategy_text,
+                              "verification_agent": verification_text},
+            "growth_opportunities": plan.get("growth_opportunities", []),
+            "business_risks": plan.get("business_risks", []),
+            "improvement_plan": plan.get("improvement_plan", []),
+            "contradictions_resolved": plan.get("contradictions_resolved", []),
+            "kpi_snapshot": data["exec_kpis"],
+            "monthly_trends": data["monthly"],
+            "category_performance": data["category"],
+            "channel_performance": data["channel"],
             "recommendations": [
-                {"id": r.id, "title": r.title, "category": r.category, "expected_roi": r.expected_roi} for r in created_recs
-            ]
+                {"id": r.id, "title": r.title, "category": r.category,
+                 "expected_roi": r.expected_roi, "status": r.status} for r in created
+            ],
         }
         db.commit()
 
-        # Generate Downloadable PDF Reports
-        pdf_service = PDFReportService()
-        pdf_path = pdf_service.generate_consolidated_bi_report(
+        # ---- PDF report -----------------------------------------------------------
+        pdf_path = PDFReportService().generate_consolidated_bi_report(
             session_id=session_id,
-            kpi_data=exec_kpis,
-            monthly_data=monthly_trends,
-            category_data=category_perf,
-            channel_data=channel_perf,
-            store_data=store_perf,
-            stockout_data=stock_alerts,
-            strategy_text=strategy_summary,
-            verification_text=verification_text
+            kpi_data=data["exec_kpis"],
+            monthly_data=data["monthly"],
+            category_data=data["category"],
+            channel_data=data["channel"],
+            store_data=data["store"],
+            stockout_data=data["stock_alerts"],
+            strategy_text=strategy_text,
+            verification_text=verification_text,
+            strategy_plan=plan,
+            scorecard=scorecard,
         )
-
-        # Register report record
-        rep = GeneratedReport(
+        db.add(GeneratedReport(
             session_id=session_id,
             user_id=session.user_id,
             report_type="Consolidated",
@@ -419,17 +527,21 @@ def run_multi_agent_analysis(session_id: int):
             file_path=pdf_path,
             file_size_bytes=os.path.getsize(pdf_path) if os.path.exists(pdf_path) else 0,
             period_start=datetime(2026, 5, 1).date(),
-            period_end=datetime(2026, 10, 31).date()
-        )
-        db.add(rep)
+            period_end=datetime(2026, 10, 31).date(),
+        ))
         db.commit()
+        print(f"Session {session_id}: {session.status} in {session.execution_duration_sec}s")
 
-        print(f"Multi-Agent session {session_id} finished successfully in {session.execution_duration_sec}s. PDF generated at {pdf_path}")
-
-    except Exception as e:
-        print(f"Error in multi-agent session {session_id}: {str(e)}")
+    except Exception as exc:  # noqa: BLE001 - surfaced to the UI via session/log state
+        db.rollback()
+        message = f"{type(exc).__name__}: {exc}"
+        print(f"Error in multi-agent session {session_id}: {message}")
+        if tracker:
+            tracker.fail_running(message)
         if session:
             session.status = "Failed"
+            session.completed_at = datetime.utcnow()
+            session.consolidated_plan = {"error": message[:1000]}
             db.commit()
     finally:
         db.close()
