@@ -15,9 +15,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code and dataset
 COPY . .
 
-# Initialize DB on build or run
-RUN python backend/init_db.py
+# Set Python path to ensure backend modules resolve properly
+ENV PYTHONPATH=/app
 
 EXPOSE 8000
 
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run database initialization/migrations and start FastAPI with dynamic port binding for Render
+CMD ["sh", "-c", "python backend/init_db.py && uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
